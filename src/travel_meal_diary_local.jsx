@@ -3,6 +3,7 @@ import * as XLSX from "xlsx";
 
 // ── ATO TD 2025/4 ─────────────────────────────────────────────────────────────
 // Rate tables by financial year (Table 1, salary band <= threshold)
+// To add a new year: append an entry when the ATO publishes the new determination (usually early July)
 const RATE_YEARS = [
   {
     fy: "2024-25", ref: "TD 2024/3", from: "2024-07-01", to: "2025-06-30",
@@ -106,7 +107,7 @@ const LOCATIONS = [
 ];
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
-const STORAGE_KEY = "travel-meal-diary-cap-v1";
+const STORAGE_KEY = "travel-meal-diary-v5";
 const MAX_DAYS    = 31;
 const todayISO    = () => new Date().toISOString().slice(0, 10);
 const parseDate   = (s) => new Date(s + "T12:00:00");
@@ -159,7 +160,7 @@ export default function TravelMealDiary() {
   const [locType,   setLocType]   = useState(null);
   const [startDate, setStartDate] = useState(todayISO());
   const [endDate,   setEndDate]   = useState(todayISO());
-  const [rateCap,   setRateCap]   = useState("100");
+  const [spendPct,  setSpendPct]  = useState(String(DEFAULT_SPEND_PCT));
   const [purpose,   setPurpose]   = useState("");
   const [expDays,   setExpDays]   = useState([]);
   const [sugg,      setSugg]      = useState([]);
@@ -169,17 +170,27 @@ export default function TravelMealDiary() {
   const [diaryEdit, setDiaryEdit] = useState({}); // tripId -> editable actuals
   const [flash,     setFlash]     = useState(null);
   const [deleteId,  setDeleteId]  = useState(null);
+  const [dirty,     setDirty]     = useState(0);
+  const [fySel,     setFySel]     = useState("all");
 
   useEffect(() => {
     try {
       const r = localStorage.getItem(STORAGE_KEY);
       if (r) setTrips(JSON.parse(r));
+      setDirty(parseInt(localStorage.getItem(STORAGE_KEY + ":dirty")) || 0);
     } catch {}
     setReady(true);
   }, []);
 
   const persist = useCallback(async (data) => {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {}
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      setDirty(d => {
+        const n = d + 1;
+        localStorage.setItem(STORAGE_KEY + ":dirty", String(n));
+        return n;
+      });
+    } catch {}
   }, []);
 
   useEffect(() => {
@@ -216,15 +227,15 @@ export default function TravelMealDiary() {
     if (!locType)          return showFlash("err", "Select a location type.");
     if (!purpose.trim())   return showFlash("err", "Enter a work purpose.");
     if (!expDays.length)   return showFlash("err", "Select a valid date range.");
-    const rc = parseFloat(rateCap);
-    if (!rc || rc <= 0)    return showFlash("err", "Enter a valid daily cap.");
+    const pct = parseFloat(spendPct);
+    if (!pct || pct <= 0 || pct > 100) return showFlash("err", "Enter a spend % between 1 and 100.");
     if (!expDays.some(d => d.B || d.L || d.D))
                            return showFlash("err", "Select expected meals for at least one day.");
     const trip = {
       id: Date.now(),
       determinedOn: todayISO(),
       dest: destInput.trim(), locType, startDate, endDate,
-      rateCap: rc, purpose: purpose.trim(),
+      spendPct: pct, purpose: purpose.trim(),
       days: expDays.map(d => ({
         date: d.date,
         expected: { B: d.B, L: d.L, D: d.D },
@@ -234,7 +245,7 @@ export default function TravelMealDiary() {
     const next = [trip, ...trips]; setTrips(next); await persist(next);
     setDestInput(""); setDestLoc(null); setLocType(null);
     setStartDate(todayISO()); setEndDate(todayISO());
-    setRateCap("100"); setPurpose(""); setExpDays([]);
+    setSpendPct(String(DEFAULT_SPEND_PCT)); setPurpose(""); setExpDays([]);
     showFlash("ok", "Allowance determination saved — this is now the fixed amount to pay in MYOB.");
   };
 
@@ -266,10 +277,14 @@ export default function TravelMealDiary() {
   };
 
   // ── Excel export ─────────────────────────────────────────────────────────────
+  // ── Financial year filter ───────────────────────────────────────────────────
+  const fyList   = [...new Set(trips.map(t => fyOf(t.startDate)))].sort().reverse();
+  const visTrips = fySel === "all" ? trips : trips.filter(t => fyOf(t.startDate) === fySel);
+
   const exportExcel = () => {
-    if (!trips.length) return showFlash("err", "No trips to export.");
+    if (!visTrips.length) return showFlash("err", fySel === "all" ? "No trips to export." : `No trips in FY ${fySel}.`);
     const rows = [];
-    [...trips].sort((a, b) => a.startDate.localeCompare(b.startDate)).forEach(trip => {
+    [...visTrips].sort((a, b) => a.startDate.localeCompare(b.startDate)).forEach(trip => {
       trip.days.forEach(day => {
         const det = dayAllowance(day.date, day.expected, trip.locType, tripPct(trip), trip.rateCap);
         const act = dayActual(day);
@@ -283,8 +298,7 @@ export default function TravelMealDiary() {
           "Expected Breakfast":       day.expected.B ? "Yes" : "No",
           "Expected Lunch":           day.expected.L ? "Yes" : "No",
           "Expected Dinner":          day.expected.D ? "Yes" : "No",
-          "Daily Cap ($)":            trip.rateCap ?? "",
-          "Allowance Model":          "min(cap, expected meals + 80% incidentals)",
+          "Allowance % of ATO Rate":  trip.spendPct ? `${trip.spendPct}%` : "legacy cap $" + trip.rateCap,
           "ATO Full Rate ($)":        Math.round(det.atoFull * 100) / 100,
           "Day Allowance ($)":        det.allowance,
           "Actual Breakfast ($)":     parseFloat(day.actual.B) || "",
@@ -308,12 +322,59 @@ export default function TravelMealDiary() {
       { wch: 20 }, { wch: 12 }, { wch: 44 }, { wch: 8 }, { wch: 13 },
     ];
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "ATO Travel Diary Cap");
-    XLSX.writeFile(wb, "ato_travel_allowance_diary_cap.xlsx");
+    XLSX.utils.book_append_sheet(wb, ws, "ATO Travel Allowance Diary");
+    XLSX.writeFile(wb, `ato_travel_allowance_diary${fySel === "all" ? "" : "_FY" + fySel}.xlsx`);
   };
 
   // ── Recommendation engine ────────────────────────────────────────────────────
-  const completed = trips.filter(tripHasDiary);
+  // ── JSON backup / restore ───────────────────────────────────────────────────
+  const exportBackup = () => {
+    if (!trips.length) return showFlash("err", "No trips to back up.");
+    const groups = {};
+    trips.forEach(t => { const fy = fyOf(t.startDate); (groups[fy] ??= []).push(t); });
+    const fys = fySel === "all" ? Object.keys(groups).sort() : (groups[fySel] ? [fySel] : []);
+    if (!fys.length) return showFlash("err", `No trips in FY ${fySel}.`);
+    fys.forEach((fy, i) => {
+      const blob = new Blob(
+        [JSON.stringify({ app: "ato-travel-diary", version: 2, fy, storageKey: STORAGE_KEY, exportedAt: new Date().toISOString(), trips: groups[fy] }, null, 2)],
+        { type: "application/json" }
+      );
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `travel_diary_backup_FY${fy}_${todayISO()}.json`;
+      setTimeout(() => { a.click(); URL.revokeObjectURL(a.href); }, i * 400);
+    });
+    localStorage.setItem(STORAGE_KEY + ":dirty", "0");
+    setDirty(0);
+    showFlash("ok", `${fys.length} backup file${fys.length === 1 ? "" : "s"} exported — one per financial year.`);
+  };
+
+  const importBackup = () => {
+    const inp = document.createElement("input");
+    inp.type = "file";
+    inp.accept = ".json,application/json";
+    inp.onchange = async (ev) => {
+      const file = ev.target.files?.[0];
+      if (!file) return;
+      try {
+        const data = JSON.parse(await file.text());
+        const incoming = Array.isArray(data) ? data : data.trips;
+        if (!Array.isArray(incoming)) throw new Error("bad format");
+        const ids = new Set(trips.map(t => t.id));
+        const added = incoming.filter(t => t && t.id && t.days && !ids.has(t.id));
+        if (!added.length) return showFlash("ok", "Import checked — all trips in that backup are already present.");
+        const next = [...added, ...trips];
+        setTrips(next);
+        await persist(next);
+        showFlash("ok", `Import complete — ${added.length} trip${added.length === 1 ? "" : "s"} added, ${incoming.length - added.length} already present.`);
+      } catch {
+        showFlash("err", "Could not read that file — is it a diary JSON backup?");
+      }
+    };
+    inp.click();
+  };
+
+  const completed = visTrips.filter(tripHasDiary);
   const recDays = completed.flatMap(t => t.days.filter(d => dayActual(d) > 0).map(d => ({
     allowance: dayAllowance(d.date, d.expected, t.locType, tripPct(t), t.rateCap).allowance,
     actual: dayActual(d),
@@ -324,13 +385,13 @@ export default function TravelMealDiary() {
   const avg = arr => arr.length ? arr.reduce((s, x) => s + x, 0) / arr.length : 0;
 
   // ── Derived form state ───────────────────────────────────────────────────────
-  const capVal   = parseFloat(rateCap) || 100;
+  const pctVal   = Math.min(100, Math.max(1, parseFloat(spendPct) || DEFAULT_SPEND_PCT));
   const locRates = ratesAt(startDate, locType || "regional");
   const formRef  = rateYearFor(startDate).ref;
   const nDays    = startDate && endDate && endDate >= startDate ? datesBetween(startDate, endDate).length : 0;
   const showGrid = locType && nDays > 0 && nDays <= MAX_DAYS && expDays.length === nDays;
-  const formTotal = showGrid ? expDays.reduce((s, d) => s + dayAllowance(d.date, d, locType, null, capVal).allowance, 0) : 0;
-  const ytdAllow  = trips.reduce((s, t) => s + tripAllowance(t), 0);
+  const formTotal = showGrid ? expDays.reduce((s, d) => s + dayAllowance(d.date, d, locType, pctVal).allowance, 0) : 0;
+  const ytdAllow  = visTrips.reduce((s, t) => s + tripAllowance(t), 0);
 
   return (
     <div style={{ minHeight: "100vh", background: "#F4F1EB", fontFamily: "'Inter', system-ui, sans-serif", fontSize: 14, color: "#1A2535" }}>
@@ -341,14 +402,14 @@ export default function TravelMealDiary() {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 12 }}>
             <div>
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 3 }}>
-                <span style={{ fontSize: 20, fontWeight: 700 }}>ATO Travel Allowance Diary — Cap Edition</span>
-                <span style={BDG("#2A7B5E", "#D8F3DC")}>ATO TD 2025/4</span>
+                <span style={{ fontSize: 20, fontWeight: 700 }}>ATO Travel Allowance Diary</span>
+                <span style={BDG("#2A7B5E", "#D8F3DC")}>{rateYearFor(todayISO()).ref}</span>
               </div>
               <p style={{ margin: "0 0 14px", color: "#8FA3B8", fontSize: 12 }}>
                 1. Determine allowance before travel (fixed) · 2. Record actual spend after (evidence) · Allowance is never adjusted by actuals
               </p>
               <div style={{ display: "flex", gap: 28, flexWrap: "wrap" }}>
-                {[["Trips", trips.length], ["Diaries done", completed.length], ["YTD allowances", `$${ytdAllow.toFixed(2)}`]].map(([l, v]) => (
+                {[["Trips", visTrips.length], ["Diaries done", completed.length], [(fySel === "all" ? "All-year" : "FY " + fySel) + " allowances", `$${ytdAllow.toFixed(2)}`]].map(([l, v]) => (
                   <div key={l}>
                     <div style={{ fontSize: 10, color: "#8FA3B8", textTransform: "uppercase", letterSpacing: "0.6px" }}>{l}</div>
                     <div style={{ fontSize: 24, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>{v}</div>
@@ -356,10 +417,32 @@ export default function TravelMealDiary() {
                 ))}
               </div>
             </div>
-            <button onClick={exportExcel}
-              style={{ background: "#C97A3A", color: "#fff", border: "none", borderRadius: 8, padding: "10px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>
-              ↓ Export to Excel
-            </button>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end" }}>
+              <select value={fySel} onChange={e => setFySel(e.target.value)}
+                style={{ background: "#2A3B52", color: "#D8E4F0", border: "1px solid #3D5270", borderRadius: 7, padding: "7px 10px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                <option value="all">All financial years</option>
+                {fyList.map(fy => <option key={fy} value={fy}>FY {fy}</option>)}
+              </select>
+              <button onClick={exportExcel}
+                style={{ background: "#C97A3A", color: "#fff", border: "none", borderRadius: 8, padding: "10px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>
+                ↓ Export to Excel
+              </button>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={exportBackup}
+                  style={{ background: "#2A3B52", color: "#D8E4F0", border: "1px solid #3D5270", borderRadius: 7, padding: "7px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
+                  ⬇ Backup JSON
+                </button>
+                <button onClick={importBackup}
+                  style={{ background: "#2A3B52", color: "#D8E4F0", border: "1px solid #3D5270", borderRadius: 7, padding: "7px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
+                  ⬆ Import
+                </button>
+              </div>
+              {dirty > 0 && (
+                <span style={{ fontSize: 11, fontWeight: 600, color: "#FFD97A", background: "#4A3A12", borderRadius: 5, padding: "3px 9px", whiteSpace: "nowrap" }}>
+                  ⚠ {dirty} change{dirty === 1 ? "" : "s"} since last backup
+                </span>
+              )}
+            </div>
           </div>
         </div>
       </header>
@@ -436,8 +519,8 @@ export default function TravelMealDiary() {
               <input type="date" value={endDate} min={startDate} onChange={e => setEndDate(e.target.value)} style={INP} />
             </div>
             <div>
-              <label style={LBL}>Daily cap $</label>
-              <input type="text" inputMode="decimal" value={rateCap} onChange={e => setRateCap(e.target.value)}
+              <label style={LBL}>Spend % of ATO</label>
+              <input type="text" inputMode="decimal" value={spendPct} onChange={e => setSpendPct(e.target.value)}
                 style={{ ...INP, textAlign: "right", fontFamily: "monospace" }} />
             </div>
           </div>
@@ -472,8 +555,8 @@ export default function TravelMealDiary() {
             <div style={{ marginBottom: 16 }}>
               <div style={{ fontSize: 12, color: "#8FA3B8", marginBottom: 8 }}>
                 Tick meals <strong>reasonably expected</strong> each day (e.g. untick breakfast/lunch on a 6pm departure day) ·
-                Rates: {formRef} (auto-selected from trip dates) · Incidentals provision {fmt$(Math.round(locRates.I * 0.8 * 100) / 100)}/day (80% of {fmt$(locRates.I)}) included automatically ·
-                Day allowance = min(${capVal.toFixed(2)}, expected meals + provision), rounded down to nearest $5
+                Rates: {formRef} (auto-selected from trip dates) · Incidentals {fmt$(locRates.I)}/day included automatically ·
+                Day allowance = {pctVal}% of ATO rate for expected meals + incidentals, rounded down to nearest $5 — scales with location automatically
               </div>
               <div style={{ overflowX: "auto", borderRadius: 8, border: "1px solid #E8E4DC" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 560 }}>
@@ -491,7 +574,7 @@ export default function TravelMealDiary() {
                   </thead>
                   <tbody>
                     {expDays.map((day, i) => {
-                      const det = dayAllowance(day.date, day, locType, null, capVal);
+                      const det = dayAllowance(day.date, day, locType, pctVal);
                       return (
                         <tr key={day.date} style={{ background: i % 2 === 0 ? "#fff" : "#FAFAF8" }}>
                           <td style={{ padding: "8px 8px 8px 12px", fontSize: 12, color: "#5A6A7A", whiteSpace: "nowrap" }}>{fmtShort(day.date)}</td>
@@ -566,15 +649,15 @@ export default function TravelMealDiary() {
         {/* ── TRIP CARDS ── */}
         {!ready ? (
           <div style={{ textAlign: "center", padding: 40, color: "#8FA3B8" }}>Loading…</div>
-        ) : trips.length === 0 ? (
+        ) : visTrips.length === 0 ? (
           <div style={{ textAlign: "center", padding: 48, background: "#fff", borderRadius: 10, color: "#8FA3B8" }}>
             <div style={{ fontSize: 36, marginBottom: 8 }}>📋</div>
-            <div style={{ fontWeight: 600, marginBottom: 4 }}>No trips yet</div>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>{fySel === "all" ? "No trips yet" : `No trips in FY ${fySel}`}</div>
             <div style={{ fontSize: 13 }}>Create a pre-trip allowance determination above</div>
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {[...trips].sort((a, b) => b.startDate.localeCompare(a.startDate)).map(t => {
+            {[...visTrips].sort((a, b) => b.startDate.localeCompare(a.startDate)).map(t => {
               const allow = tripAllowance(t);
               const hasDiary = tripHasDiary(t);
               const actual = tripActual(t);
@@ -738,7 +821,7 @@ export default function TravelMealDiary() {
         )}
 
         <p style={{ textAlign: "center", marginTop: 22, fontSize: 11, color: "#B0BAC5" }}>
-          Cap Edition · FY2024-25 (TD 2024/3): Cap B $33.90 / L $38.10 / D $64.95, Reg B $30.35 / L $34.65 / D $59.75, Inc $23.95 · FY2025-26 (TD 2025/4): Cap B $34.75 / L $39.10 / D $66.65, Reg B $31.15 / L $35.55 / D $61.30, Inc $24.50 · Rate year auto-selected per day
+          Rate year auto-selected per day · FY2024-25 (TD 2024/3): Cap B $33.90 / L $38.10 / D $64.95, Reg B $30.35 / L $34.65 / D $59.75, Inc $23.95 · FY2025-26 (TD 2025/4): Cap B $34.75 / L $39.10 / D $66.65, Reg B $31.15 / L $35.55 / D $61.30, Inc $24.50 · Allowance {DEFAULT_SPEND_PCT}% of ATO rate, rounded down to $5
         </p>
       </div>
     </div>
